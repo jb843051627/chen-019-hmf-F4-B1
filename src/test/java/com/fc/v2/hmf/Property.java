@@ -34,12 +34,30 @@ final class Property {
         Class<?> c = type;
         while (c != null && c != Object.class) {
             for (Field f : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
                 f.setAccessible(true);
                 map.putIfAbsent(f.getName(), f);
             }
             c = c.getSuperclass();
         }
         return map;
+    }
+
+    /** 把 src 非空字段誊到 dst（测试用：模拟 update(entity, wrapper) 只写非空列）。 */
+    static void copyNonNull(Object src, Object dst) {
+        Map<String, Field> fields = CACHE.computeIfAbsent(src.getClass(), Property::index);
+        for (Field f : fields.values()) {
+            try {
+                Object v = f.get(src);
+                if (v != null) {
+                    f.set(dst, v);
+                }
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     private static String camel(String column) {

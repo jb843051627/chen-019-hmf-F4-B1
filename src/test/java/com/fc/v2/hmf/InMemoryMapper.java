@@ -93,7 +93,15 @@ abstract class InMemoryMapper<T> implements BaseMapper<T> {
 
     @Override
     public int update(T entity, Wrapper<T> updateWrapper) {
-        throw new UnsupportedOperationException();
+        // 与 MyBatis-Plus 一致：命中的行只誊 entity 的非空字段。
+        int affected = 0;
+        for (T row : rows) {
+            if (WrapperEval.matches(row, updateWrapper)) {
+                Property.copyNonNull(entity, row);
+                affected++;
+            }
+        }
+        return affected;
     }
 
     @Override
@@ -108,7 +116,8 @@ abstract class InMemoryMapper<T> implements BaseMapper<T> {
 
     @Override
     public T selectOne(Wrapper<T> queryWrapper) {
-        throw new UnsupportedOperationException();
+        List<T> list = selectList(queryWrapper);
+        return list.isEmpty() ? null : list.get(0);
     }
 
     @Override
