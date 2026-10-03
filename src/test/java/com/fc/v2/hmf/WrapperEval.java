@@ -58,7 +58,12 @@ final class WrapperEval {
             Object expected = params.get(m.group(1));
             Object actual = Property.get(row, column);
             if ("=".equals(op)) {
-                if (expected == null ? actual != null : !expected.equals(actual)) {
+                // 真 JDBC 里 int/bigint 按数值相等；假 Mapper 这边 Integer/Long 不能用 equals 判死。
+                if (expected instanceof Number && actual instanceof Number) {
+                    if (((Number) expected).doubleValue() != ((Number) actual).doubleValue()) {
+                        return false;
+                    }
+                } else if (expected == null ? actual != null : !expected.equals(actual)) {
                     return false;
                 }
             }

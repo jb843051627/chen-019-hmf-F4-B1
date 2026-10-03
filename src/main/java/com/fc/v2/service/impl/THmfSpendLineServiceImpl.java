@@ -1,6 +1,7 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -15,38 +16,43 @@ import com.fc.v2.service.ITHmfSpendLineService;
 /**
  * 支出审定额线 Service业务层处理（rule-eval 形状）
  *
+ * “某时刻可用”只有一处口径（见 {@link #availableRows(Date)}）：未删、现行（status=0）、
+ * 已到启用之日（eff_start 含当日）且未到交棒之日（eff_end 不含当日）；启用/交棒日为空
+ * 分别当作“早就启用”“永不交棒”。列表、计数、单条可用性、单规则定位全照这一处数，
+ * 不许各写各的。可用线统一按优先级降序、ruleCode 降序、启用之日降序、主键降序排定，
+ * evaluateTop 与同号多版定位都取排完序的头一条。
+ *
  * @author fuce
  * @date 2026-09-14
  */
 @Service
 public class THmfSpendLineServiceImpl implements ITHmfSpendLineService {
 
-    /** 优先级降序；并列按 ruleCode 降序（确定性） */
-    private static final Comparator<THmfSpendLine> PRIORITY_THEN_CODE_DESC = new Comparator<THmfSpendLine>() {
+    /** 线的情形：现行 */
+    private static final int STATUS_ACTIVE = 0;
+
+    /** 优先级降序；并列按 ruleCode 降序，再并列按启用之日降序、主键降序（确定性） */
+    private static final Comparator<THmfSpendLine> AVAILABLE_ORDER = new Comparator<THmfSpendLine>() {
         @Override
         public int compare(THmfSpendLine a, THmfSpendLine b) {
-            int pa = a.getPriority() == null ? 0 : a.getPriority();
-            int pb = b.getPriority() == null ? 0 : b.getPriority();
-            if (pa != pb) {
-                return pb - pa;
+            int byPriority = cmpInt(b.getPriority(), a.getPriority());
+            if (byPriority != 0) {
+                return byPriority;
             }
-            String ca = a.getRuleCode() == null ? "" : a.getRuleCode();
-            String cb = b.getRuleCode() == null ? "" : b.getRuleCode();
-            return cb.compareTo(ca);
+            int byCode = cmpStr(b.getRuleCode(), a.getRuleCode());
+            if (byCode != 0) {
+                return byCode;
+            }
+            int byStart = cmpDate(b.getEffStart(), a.getEffStart());
+            if (byStart != 0) {
+                return byStart;
+            }
+            return cmpLong(b.getId(), a.getId());
         }
     };
 
     @javax.annotation.Resource
     private THmfSpendLineMapper hmfSpendLineMapper;
-
-    /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
-     * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
-     */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
-    }
 
     @Override
     public THmfSpendLine selectTHmfSpendLineById(Long id) {
@@ -58,7 +64,7 @@ public class THmfSpendLineServiceImpl implements ITHmfSpendLineService {
         if (at == null) {
             return new java.util.ArrayList<THmfSpendLine>();
         }
-        return this.hmfSpendLineMapper.selectList(new QueryWrapper<THmfSpendLine>().eq("del_flag", 0));
+        return availableRows(at);
     }
 
     @Override
@@ -79,7 +85,7 @@ public class THmfSpendLineServiceImpl implements ITHmfSpendLineService {
                 || input.compareTo(new BigDecimal("100")) > 0) {
             return 0;
         }
-        List<THmfSpendLine> avail = listAvailable(at);
+        List<THmfSpendLine> avail = availableRows(at);
         if (avail.isEmpty()) {
             return 0;
         }
@@ -92,7 +98,8 @@ public class THmfSpendLineServiceImpl implements ITHmfSpendLineService {
             return false;
         }
         THmfSpendLine r = this.hmfSpendLineMapper.selectById(id);
-        return r != null;
+        // 与列表/定位同处一把尺：删掉的、停用的、没到启用日的、已交棒的都不算可用。
+        return r != null && isAvailable(r, at);
     }
 
     @Override
@@ -100,42 +107,62 @@ public class THmfSpendLineServiceImpl implements ITHmfSpendLineService {
         if (at == null) {
             return 0;
         }
-        return this.hmfSpendLineMapper
-                .selectList(new QueryWrapper<THmfSpendLine>().eq("del_flag", 0)).size();
+        return availableRows(at).size();
     }
 
-    private THmfSpendLine findRule(String ruleCode, Date at) {
-        List<THmfSpendLine> hit = this.hmfSpendLineMapper.selectList(new QueryWrapper<THmfSpendLine>()
-                .eq("del_flag", 0).eq("rule_code", ruleCode));
-        THmfSpendLine newest = null;
-        for (THmfSpendLine r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
+    /**
+     * 唯一一处“某时刻可用”口径：未删、现行、已启用（含当日）、未交棒（交棒日不含）。
+     * 一次取齐照统一次序排定，列表/计数/定位/单条可用性都从这一份往下裁。
+     */
+    private List<THmfSpendLine> availableRows(Date at) {
+        List<THmfSpendLine> rows = this.hmfSpendLineMapper.selectList(new QueryWrapper<THmfSpendLine>()
+                .eq("del_flag", 0));
+        java.util.List<THmfSpendLine> avail = new java.util.ArrayList<THmfSpendLine>();
+        for (THmfSpendLine r : rows) {
+            if (isAvailable(r, at)) {
+                avail.add(r);
             }
         }
-        return newest;
+        Collections.sort(avail, AVAILABLE_ORDER);
+        return avail;
     }
 
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(THmfSpendLine r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
+    /** 单条可用性判定：与 {@link #availableRows(Date)} 同一把尺。 */
+    private boolean isAvailable(THmfSpendLine r, Date at) {
+        if (r == null || r.getDelFlag() != null && r.getDelFlag() != 0) {
+            return false;
         }
-        if (tier == 2) {
-            return r.getTh2Max();
+        if (r.getStatus() != null && r.getStatus() != STATUS_ACTIVE) {
+            return false;
         }
-        return r.getTh3Max();
+        // 启用之日含当日：恰好落在启用那一刻便可用。
+        if (r.getEffStart() != null && at.before(r.getEffStart())) {
+            return false;
+        }
+        // 交棒之日不含：到交棒那一刻这条线已不说话。
+        if (r.getEffEnd() != null && !at.before(r.getEffEnd())) {
+            return false;
+        }
+        return true;
     }
 
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(THmfSpendLine r, int tier) {
-        return r.getTh1Max();
+    /** 同号多版：在 at 时刻可用的版本里取统一次序的头一条（优先级高者、再新启用者）。 */
+    private THmfSpendLine findRule(String ruleCode, Date at) {
+        for (THmfSpendLine r : availableRows(at)) {
+            if (ruleCode.equals(r.getRuleCode())) {
+                return r;
+            }
+        }
+        return null;
     }
 
-    /** 分档：等于上限取高一档 */
+    /**
+     * 分档：等于上限取高一档。阈值没维护到的档不参与，三档阈值皆缺返回 0（调用方按不可用处理）。
+     */
     private int levelOf(THmfSpendLine rule, BigDecimal input) {
+        if (rule == null) {
+            return 0;
+        }
         if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
             return 1;
         }
@@ -145,6 +172,34 @@ public class THmfSpendLineServiceImpl implements ITHmfSpendLineService {
         if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) <= 0) {
             return 3;
         }
+        if (rule.getTh1Max() == null && rule.getTh2Max() == null && rule.getTh3Max() == null) {
+            return 0;
+        }
         return 4;
+    }
+
+    private static int cmpInt(Integer a, Integer b) {
+        return (a == null ? 0 : a.intValue()) - (b == null ? 0 : b.intValue());
+    }
+
+    private static int cmpLong(Long a, Long b) {
+        return Long.compare(a == null ? 0L : a.longValue(), b == null ? 0L : b.longValue());
+    }
+
+    private static int cmpStr(String a, String b) {
+        return (a == null ? "" : a).compareTo(b == null ? "" : b);
+    }
+
+    private static int cmpDate(Date a, Date b) {
+        if (a == null && b == null) {
+            return 0;
+        }
+        if (a == null) {
+            return -1;
+        }
+        if (b == null) {
+            return 1;
+        }
+        return a.compareTo(b);
     }
 }
